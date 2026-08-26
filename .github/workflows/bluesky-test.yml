@@ -1,0 +1,135 @@
+name: 接続テスト（Bluesky）
+
+# このファイル1つで完結します。他のファイルは要りません。
+# GitHub の Actions タブから手で実行してください。
+#
+#   既定（投稿しない）… ログインできるか、画像を送れるかだけを確認します
+#   post_text にチェック … テキストだけの投稿を1件行います（あとで削除できます）
+
+on:
+  workflow_dispatch:
+    inputs:
+      post_text:
+        description: 'テスト投稿を実際に行う（チェックを入れなければ投稿しません）'
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Bluesky に接続してみる
+        env:
+          BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
+          BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
+          DO_POST: ${{ github.event.inputs.post_text }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+          from datetime import datetime, timezone
+
+          PDS = "https://bsky.social"
+          # 先頭の @ は identifier では使えないので落とす
+          handle = os.environ.get("BLUESKY_HANDLE", "").strip().lstrip("@")
+          pw     = os.environ.get("BLUESKY_APP_PASSWORD", "").strip()
+          do_post = os.environ.get("DO_POST") == "true"
+
+          def show(msg): print(msg, flush=True)
+
+          def api(path, payload=None, token=None, blob=None, ctype=None):
+              h = {}
+              if token: h["Authorization"] = "Bearer " + token
+              if blob is not None:
+                  data, h["Content-Type"] = blob, ctype
+              else:
+                  data = json.dumps(payload).encode(); h["Content-Type"] = "application/json"
+              req = urllib.request.Request(PDS + "/xrpc/" + path, data=data, headers=h)
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.loads(r.read().decode())
+
+          show("=" * 52)
+          if not handle or not pw:
+              show("【失敗】Secrets が読めていません。")
+              show("")
+              show("リポジトリの Settings → Secrets and variables → Actions で")
+              show("次の2つが登録されているか確認してください（名前の綴りに注意）:")
+              show("  BLUESKY_HANDLE        例: economy-social.bsky.social")
+              show("  BLUESKY_APP_PASSWORD  例: xxxx-xxxx-xxxx-xxxx")
+              sys.exit(1)
+
+          show(f"1. ログインします … {handle}")
+          try:
+              s = api("com.atproto.server.createSession",
+                      {"identifier": handle, "password": pw})
+          except urllib.error.HTTPError as e:
+              body = e.read().decode(errors="replace")
+              show(f"   【失敗】HTTP {e.code}")
+              show(f"   {body}")
+              show("")
+              if e.code == 401:
+                  show("   401 はハンドルかアプリパスワードの誤りです。よくある原因:")
+                  show("   ・通常のログインパスワードを入れている")
+                  show("     → アプリパスワードは 設定 → プライバシーとセキュリティ →")
+                  show("       アプリパスワード で別途発行するものです")
+                  show("     → xxxx-xxxx-xxxx-xxxx の形式（4文字ずつハイフン区切り）")
+                  show("   ・ハンドルの .bsky.social が抜けている")
+                  show("   ・コピー時に前後の空白や改行が入っている")
+              sys.exit(1)
+
+          did = s["did"]; token = s["accessJwt"]
+          show(f"   成功。DID: {did}")
+          if s.get("handle") and s["handle"].lstrip("@") != handle:
+              show(f"   （サーバー上のハンドルは {s['handle']} です）")
+
+          show("")
+          show("2. 画像を送れるか確認します（この画像は公開されません）")
+          # 1x1 の透明PNG。疎通確認だけが目的
+          png = bytes.fromhex(
+              "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+              "890000000a49444154789c6360000002000100ffff030000060005a3fa6ff400"
+              "00000049454e44ae426082")
+          try:
+              b = api("com.atproto.repo.uploadBlob", token=token, blob=png, ctype="image/png")
+              show(f"   成功。{b['blob']['size']} バイトを受け付けました。")
+          except urllib.error.HTTPError as e:
+              show(f"   【失敗】HTTP {e.code}: {e.read().decode(errors='replace')}")
+              sys.exit(1)
+
+          show("")
+          if not do_post:
+              show("=" * 52)
+              show("接続テストはすべて成功しました。投稿はしていません。")
+              show("")
+              show("実際に1件投稿してみたい場合は、この画面の Run workflow で")
+              show("post_text にチェックを入れて再実行してください。")
+              show("=" * 52)
+              sys.exit(0)
+
+          show("3. テスト投稿します")
+          text = ("接続テストです。このアカウントは経済ニュースを毎朝1本お届けします。\n"
+                  "この投稿はテストなので、あとで削除します。")
+          rec = {"$type": "app.bsky.feed.post", "text": text, "langs": ["ja"],
+                 "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+          try:
+              out = api("com.atproto.repo.createRecord", token=token,
+                        payload={"repo": did, "collection": "app.bsky.feed.post", "record": rec})
+          except urllib.error.HTTPError as e:
+              show(f"   【失敗】HTTP {e.code}: {e.read().decode(errors='replace')}")
+              sys.exit(1)
+
+          rkey = out["uri"].rsplit("/", 1)[-1]
+          url = f"https://bsky.app/profile/{handle}/post/{rkey}"
+          show(f"   投稿しました: {url}")
+          show("")
+          show("=" * 52)
+          show("すべて成功しました。")
+          show("テスト投稿は Bluesky アプリから削除できます。")
+          show("=" * 52)
+
+          sm = os.environ.get("GITHUB_STEP_SUMMARY")
+          if sm:
+              with open(sm, "a", encoding="utf-8") as f:
+                  f.write(f"## 接続テスト成功\n\n投稿: [{url}]({url})\n\n"
+                          f"テスト投稿は Bluesky アプリから削除できます。\n")
+          PYEOF

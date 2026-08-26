@@ -1,0 +1,180 @@
+name: 朝刊3分 毎朝の生成と投稿
+
+on:
+  schedule:
+    # 21:35 UTC = 6:35 JST（毎日）
+    - cron: '35 21 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '対象日 YYYY-MM-DD（空なら今日）'
+        required: false
+        default: ''
+      dry_run:
+        description: '生成と検査だけ行い、投稿はしない'
+        type: boolean
+        default: false
+      regenerate:
+        description: '既に content.json があっても作り直す'
+        type: boolean
+        default: false
+
+concurrency:
+  group: choukan3min
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 対象日を決める
+        id: d
+        run: |
+          DAY="${{ github.event.inputs.date }}"
+          if [ -z "$DAY" ]; then DAY=$(TZ=Asia/Tokyo date +%F); fi
+          echo "day=$DAY" >> "$GITHUB_OUTPUT"
+          echo "dir=post/$DAY" >> "$GITHUB_OUTPUT"
+          echo "対象: post/$DAY"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: 日本語フォントを入れる
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
+          if fc-list :lang=ja family | grep -qi "Noto Serif CJK JP"; then
+            echo "明朝フォントを確認しました。"
+          else
+            echo "::error::Noto Serif CJK JP が見つかりません。日本語が豆腐（□）になるため中止します。"
+            fc-list :lang=ja family | sort -u | head -20
+            exit 1
+          fi
+
+      - name: Chromium を入れる
+        run: |
+          pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+
+      - name: 直近のテーマを集める（重複回避のため）
+        id: recent
+        run: |
+          {
+            echo 'topics<<TOPICS_EOF'
+            python3 scripts/recent_topics.py 7
+            echo TOPICS_EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 原稿を作る
+        if: github.event.inputs.regenerate == 'true' || hashFiles(format('{0}/content.json', steps.d.outputs.dir)) == ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-4-5' }}
+          ACCOUNT_HANDLE: ${{ vars.ACCOUNT_HANDLE || '@economy-social' }}
+          RECENT_TOPICS: ${{ steps.recent.outputs.topics }}
+        run: python3 scripts/generate.py "${{ steps.d.outputs.dir }}"
+
+      - name: 画像を書き出す
+        run: python3 scripts/render.py "${{ steps.d.outputs.dir }}"
+
+      - name: 形式を検査する
+        run: python3 scripts/validate.py "${{ steps.d.outputs.dir }}"
+
+      - name: 中身を校閲する（調査メモとの突き合わせ）
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-4-5' }}
+          REVIEW_STRICT: ${{ vars.REVIEW_STRICT }}
+        run: python3 scripts/review.py "${{ steps.d.outputs.dir }}"
+
+      - name: 生成物を残す（Actions画面から確認できる）
+        uses: actions/upload-artifact@v4
+        with:
+          name: brief-${{ steps.d.outputs.day }}
+          path: |
+            ${{ steps.d.outputs.dir }}/instagram/*.png
+            ${{ steps.d.outputs.dir }}/bluesky/*.png
+            ${{ steps.d.outputs.dir }}/*.txt
+            ${{ steps.d.outputs.dir }}/*.json
+          retention-days: 30
+
+      - name: コミットする
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${{ steps.d.outputs.dir }}"
+          git diff --staged --quiet || git commit -m "brief: ${{ steps.d.outputs.day }}"
+          git pull --rebase --autostash || true
+          git push
+
+      - name: 公開してよいか判定する
+        id: gate
+        run: |
+          # AUTO_PUBLISH が明示的に false のときだけ止める。未設定なら投稿する。
+          PUB=true
+          if [ "${{ vars.AUTO_PUBLISH }}" = "false" ]; then
+            echo "AUTO_PUBLISH が false のため投稿しません。"; PUB=false
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "dry_run が指定されたため投稿しません。"; PUB=false
+          fi
+          if [ -f "${{ steps.d.outputs.dir }}/.posted-bluesky" ]; then
+            echo "既に投稿済みです。二重投稿を防ぐため中止します。"; PUB=false
+          fi
+          echo "publish=$PUB" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUB"
+
+      - name: Bluesky へ投稿する
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
+          BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
+        run: python3 scripts/post_bluesky.py "${{ steps.d.outputs.dir }}"
+
+      - name: 投稿済みの印を残す
+        if: steps.gate.outputs.publish == 'true'
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > "${{ steps.d.outputs.dir }}/.posted-bluesky"
+          git add "${{ steps.d.outputs.dir }}/.posted-bluesky"
+          git commit -m "posted: ${{ steps.d.outputs.day }} (bluesky)"
+          git pull --rebase --autostash || true
+          git push
+
+      - name: 投稿しなかった理由を記録する
+        if: steps.gate.outputs.publish != 'true'
+        run: |
+          {
+            echo "### ${{ steps.d.outputs.day }} の原稿ができました（未投稿）"
+            echo ""
+            echo "投稿は行っていません。理由は次のいずれかです。"
+            echo "- Variables の \`AUTO_PUBLISH\` が \`false\` になっている"
+            echo "- 実行時に \`dry_run\` に ✓ が入っていた"
+            echo "- 既に \`.posted-bluesky\` があり、二重投稿を防いだ"
+            echo ""
+            echo "上の Artifacts から画像とキャプションを確認できます。"
+            echo "投稿するには Run workflow を \`dry_run\` なしで再実行してください。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 失敗したら Issue を立てる
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "朝刊3分 ${{ steps.d.outputs.day }} の生成に失敗しました" \
+            --body "実行ログ: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+投稿は行われていません。ログを確認してください。よくある原因:
+- \`ANTHROPIC_API_KEY\` の期限切れ・残高不足
+- 検査（validate.py）に引っかかった（禁止表現・文字数超過・出典不足など）
+- Bluesky のアプリパスワードが失効している" \
+            2>/dev/null || echo "Issue の作成をスキップしました"
