@@ -169,12 +169,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 本文は必ず printf で組み立てる。ここに素の複数行文字列を書くと
+          # 行頭が run: | の字下げから外れ、YAML のブロックが途中で終わる。
+          # そうなるとワークフロー全体が起動前に失敗する（過去に踏んだ）。
+          BODY=$(printf '%s\n' \
+            "実行ログ: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "" \
+            "投稿は行われていません。ログを確認してください。よくある原因:" \
+            "- \`ANTHROPIC_API_KEY\` の期限切れ・残高不足" \
+            "- 検査（validate.py）に引っかかった（禁止表現・文字数超過・出典不足など）" \
+            "- Bluesky のアプリパスワードが失効している")
           gh issue create \
             --title "朝刊3分 ${{ steps.d.outputs.day }} の生成に失敗しました" \
-            --body "実行ログ: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-投稿は行われていません。ログを確認してください。よくある原因:
-- \`ANTHROPIC_API_KEY\` の期限切れ・残高不足
-- 検査（validate.py）に引っかかった（禁止表現・文字数超過・出典不足など）
-- Bluesky のアプリパスワードが失効している" \
+            --body "$BODY" \
             2>/dev/null || echo "Issue の作成をスキップしました"
