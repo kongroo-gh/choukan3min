@@ -9,12 +9,30 @@
     CLAUDE_MODEL        任意（既定 claude-sonnet-4-5）
     ACCOUNT_HANDLE      任意（既定 @economy-social）
     RECENT_TOPICS       任意。直近の投稿テーマを改行区切りで渡すと重複を避ける
+    FORCE_WEB_RESEARCH  任意。1 にすると research.md があっても無視して web検索する
+    DIGEST_DAYS         任意（既定 7）。何日ぶんの digest.md を選定に使うか
+    NO_WEB_SUPPLEMENT   任意。1 にすると素材が薄くても web検索で補わない
 
-APIを2回呼ぶ。
-    1回目 … web検索つきで当日のニュースを調べ、事実と数字を出典つきで書き出させる
-    2回目 … その調査メモだけを渡し、決められたJSON構造に落とし込ませる
+調査メモの出所は2通り。content.json の research_source に記録される。
 
-分けている理由は、検索と構造化を同時にやらせると構造が崩れやすいため。
+    supplied    … post/<日付>/research.md が既にある場合（NotebookLM などで人が用意）
+    web_search  … 無い場合。従来どおり web検索で自動調査し、メモ自体も作る
+
+supplied のときは、さらに過去との突き合わせが入る。
+
+    [調査] research.md を読む（web検索もAPIコールもしない）
+    [選定] 直近の digest.md と突き合わせ、今日使う素材を選ぶ
+           判定は sufficient / thin / none の3段階。基準は5枚の型を埋められるか。
+           結果は selection.json に残る。
+    [補足] thin か none のときだけ、足りない要素を web検索で補う
+           → research_source は supplied+web になる
+    [構成] 調査メモだけを根拠に、決められたJSON構造へ落とし込む
+
+補った分は research.md の末尾に追記する。review.py は原稿を research.md と
+突き合わせるので、補足をメモに入れないと正しい数字まで根拠なしと判定されるため。
+人が書いた原文（目印より前）は一字も書き換えない。
+
+digest.md は digest.py が前日の投稿後に作る。手順は NOTEBOOKLM.md を参照。
 """
 import json
 import os
@@ -102,6 +120,67 @@ SCHEMA = {
 }
 
 
+SELECT_SCHEMA = {
+    "type": "object",
+    "required": ["verdict", "reason", "focus", "use", "avoid", "gaps"],
+    "properties": {
+        "verdict": {
+            "type": "string", "enum": ["sufficient", "thin", "none"],
+            "description": "sufficient=調査メモだけで5枚を埋められる / "
+                           "thin=一部足りない / none=過去の焼き直しばかりで使える素材が実質ない",
+        },
+        "reason": {"type": "string", "description": "その判定の理由を80字程度で"},
+        "focus": {"type": "string", "description": "今日の切り口を40字程度で。過去と同じ角度にしない"},
+        "use": {"type": "array", "maxItems": 8, "items": {"type": "string"},
+                "description": "調査メモの中で今日使う論点。各40字程度"},
+        "avoid": {"type": "array", "maxItems": 8, "items": {"type": "string"},
+                  "description": "過去に同じ角度で扱い済みのため今日は避ける論点。日付を添える。"
+                                 "新しい進展がある続報なら避けなくてよい"},
+        "gaps": {"type": "array", "maxItems": 6, "items": {"type": "string"},
+                 "description": "5枚を埋めるのに足りていない要素。web検索で補う手がかりになるよう具体的に書く。"
+                                "verdict が none のときは、代わりに調べるべきテーマの手がかりを書く。"
+                                "sufficient なら空"},
+    },
+}
+
+# research.md に web検索の補足を追記するときの目印。
+# これより前は人が用意した原文で、一字も書き換えない。
+SUPPLEMENT_MARK = "<!-- 補足調査（web検索）ここから -->"
+
+
+def load_digests(day_dir, n):
+    """直近 n 日ぶんの digest.md を新しい順に集める。当日ぶんは除く。"""
+    root = day_dir.parent
+    if not root.is_dir():
+        return []
+    days = sorted((p for p in root.iterdir()
+                   if p.is_dir() and p.name != day_dir.name and (p / "digest.md").exists()),
+                  reverse=True)[:n]
+    return [(d.name, (d / "digest.md").read_text(encoding="utf-8").strip()) for d in days]
+
+
+def append_supplement(path, text):
+    """補った調査を research.md の末尾に足す。
+
+    原文（目印より前）はそのまま。何度走らせても
+    「原文 ＋ 最新の補足1つ」に落ち着くようにしてある。
+    """
+    head = path.read_text(encoding="utf-8").split(SUPPLEMENT_MARK)[0].rstrip()
+    path.write_text(f"{head}\n\n{SUPPLEMENT_MARK}\n## 補足調査（web検索で補った分）\n\n{text}\n",
+                    encoding="utf-8")
+
+
+def annotate(notes, sel):
+    """構成の工程に渡す調査メモへ、選定の結果を添える。事実は足さない。"""
+    out = [notes, "", "---", "## 選定（過去の記録と突き合わせた結果）",
+           f"- 今日の切り口: {sel.get('focus', '')}"]
+    if sel.get("use"):
+        out += ["- 使う論点:"] + [f"  - {x}" for x in sel["use"]]
+    if sel.get("avoid"):
+        out += ["- 避ける論点（過去と同じ角度になるため）:"] + [f"  - {x}" for x in sel["avoid"]]
+    return "\n".join(out)
+
+
 def call(payload, key):
     req = urllib.request.Request(
         API, data=json.dumps(payload).encode(),
@@ -127,35 +206,133 @@ def main():
     recent = os.environ.get("RECENT_TOPICS", "").strip()
 
     # ---- 1回目: 調べる ----
-    ask = (f"今日は{date_s}（日本時間）です。\n\n"
-           "今日の日本と世界の経済ニュースを web 検索で調べ、朝刊3分で扱う『今日の1本』を選んでください。\n"
-           "日本国内の話題と世界の話題のバランスを意識してください。\n\n"
-           "選んだら、次を出典URLつきの箇条書きで書き出してください。\n"
-           "1. 何が起きたか（日付・金額・水準などの具体的な数字を必ず含める）\n"
-           "2. なぜそうなるのか（因果を3段階で）\n"
-           "3. 押さえるべき数字4つ（項目名・数値・単位・補足）\n"
-           "4. 数値の推移があればその系列（2〜5点、日付と値）\n"
-           "5. 生活への影響3つ\n"
-           "6. この見方への反論・反証を1つ\n\n"
-           "裏が取れなかった数字は使わず、その旨を書いてください。")
-    if recent:
-        ask += f"\n\n直近で扱ったテーマです。重複を避けてください:\n{recent}"
+    # research.md が既に置いてあれば（NotebookLM などで人が用意した調査メモ）、それを使い
+    # web 検索はしない。無ければ従来どおり Anthropic の web_search で調べる。
+    # どちらでも以降は変わらない。「この調査メモだけを根拠に構成する」ことは同じで、
+    # review.py が原稿と突き合わせる相手も同じ research.md のまま。
+    research_path = day_dir / "research.md"
+    verdict = ""
+    supplied = ""
+    if research_path.exists() and os.environ.get("FORCE_WEB_RESEARCH", "").strip() != "1":
+        supplied = research_path.read_text(encoding="utf-8").strip()
 
-    print(f"[1/2] {date_s} のニュースを調査中…")
-    res1 = call({
-        "model": model, "max_tokens": 8000,
-        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 10}],
-        "messages": [{"role": "user", "content": ask}],
-        "system": RULES,
-    }, key)
-    notes = "".join(b.get("text", "") for b in res1["content"] if b.get("type") == "text").strip()
-    if len(notes) < 200:
-        raise SystemExit("調査結果が短すぎます。中断します。\n" + notes)
-    u1 = res1.get("usage", {})
-    print(f"  調査完了（{len(notes)}字 / in {u1.get('input_tokens')} out {u1.get('output_tokens')}）")
+    if supplied:
+        research_source = "supplied"
+        notes = supplied
+        if len(notes) < 200:
+            raise SystemExit(
+                f"{research_path} が短すぎます（{len(notes)}字）。中断します。\n"
+                "NotebookLM の要約を貼り忘れていないか確認してください。")
+        urls = sorted(set(re.findall(r"https?://[^\s<>\"'）」】、。]+", notes)))
+        if len(urls) < 2:
+            raise SystemExit(
+                f"{research_path} の出典URLが {len(urls)} 件です（2件以上必要）。\n"
+                "このまま進めても validate.py で必ず止まるため、ここで中断します。\n"
+                "NotebookLM の出力に出典URLを含めてください（NOTEBOOKLM.md を参照）。")
+        print(f"[調査] {research_path} を使います"
+              f"（{len(notes)}字 / 出典URL {len(urls)}件 / web検索はしません）")
+
+        # ---- 過去の記録と突き合わせ、今日使う素材を選ぶ ----
+        digests = load_digests(day_dir, int(os.environ.get("DIGEST_DAYS", "7") or 7))
+        past = ("\n\n".join(f"### {d}\n{t}" for d, t in digests)
+                if digests else "（過去の記録はまだありません）")
+        print(f"[選定] 過去 {len(digests)} 日ぶんの記録と突き合わせ中…")
+        res_s = call({
+            "model": model, "max_tokens": 2000,
+            "system": RULES,
+            "tools": [{"name": "emit_selection",
+                       "description": "過去の記録と突き合わせ、今日使う素材を選定する",
+                       "input_schema": SELECT_SCHEMA}],
+            "tool_choice": {"type": "tool", "name": "emit_selection"},
+            "messages": [{"role": "user", "content": (
+                f"今日は{date_s}です。今日の調査メモと、過去に投稿した日の記録があります。\n\n"
+                "過去の記録と突き合わせ、今日の朝刊3分で使う素材を選定してください。\n\n"
+                "判定の基準は、この調査メモだけで5枚の型を埋められるかどうかです。\n"
+                "  1枚目 結論の見出しと、数字を1つ\n"
+                "  2枚目 日付・金額・水準を含む事実3つ\n"
+                "  3枚目 因果を3段階で説明できるだけの材料\n"
+                "  4枚目 項目名・数値・単位がそろった数字4つ\n"
+                "  5枚目 生活への影響3つと、反対意見1つ\n"
+                "すべて埋まるなら sufficient、一部足りないなら thin、"
+                "過去と同じ角度の焼き直しばかりで使える素材が実質ないなら none です。\n\n"
+                "既に扱ったテーマでも、新しい進展があるなら続報として扱ってかまいません。"
+                "同じ角度の繰り返しになるものだけを avoid に入れてください。\n\n"
+                f"--- 過去の記録 ---\n{past}\n\n"
+                f"--- 今日の調査メモ ---\n{notes[:30000]}")}],
+        }, key)
+        blk = next((b for b in res_s["content"] if b.get("type") == "tool_use"), None)
+        if not blk:
+            raise SystemExit("選定に失敗しました。\n" + json.dumps(res_s)[:2000])
+        sel = blk["input"]
+        verdict = sel.get("verdict", "thin")
+        print(f"  判定: {verdict} — {sel.get('reason', '')}")
+        if sel.get("avoid"):
+            print(f"  過去と同じ角度のため避ける論点: {len(sel['avoid'])}件")
+        (day_dir / "selection.json").write_text(
+            json.dumps(sel, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # ---- 素材が足りなければ web検索で補う ----
+        if verdict != "sufficient" and os.environ.get("NO_WEB_SUPPLEMENT", "").strip() != "1":
+            want = ("\n".join(f"- {g}" for g in (sel.get("gaps") or []))
+                    or "- 5枚を埋めるための事実と数字")
+            print(f"[補足] 素材が {verdict} のため web検索で補います…")
+            ask2 = (f"今日は{date_s}（日本時間）です。\n\n"
+                    "手元の調査メモだけでは朝刊3分の5枚を埋められません。\n"
+                    "次の不足を web 検索で補い、出典URLつきの箇条書きで書き出してください。\n\n"
+                    f"{want}\n\n"
+                    "裏が取れなかった数字は使わず、その旨を書いてください。\n"
+                    "推計や観測を、確定した事実として書かないでください。")
+            if recent:
+                ask2 += f"\n\n直近で扱ったテーマです。重複を避けてください:\n{recent}"
+            res_w = call({
+                "model": model, "max_tokens": 8000,
+                "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 10}],
+                "messages": [{"role": "user", "content": ask2}],
+                "system": RULES,
+            }, key)
+            extra = "".join(b.get("text", "") for b in res_w["content"]
+                            if b.get("type") == "text").strip()
+            if len(extra) < 100:
+                raise SystemExit("補足の調査結果が短すぎます。中断します。\n" + extra)
+            # review.py は原稿を research.md と突き合わせる。補った分もメモに
+            # 入れておかないと、正しい数字まで根拠なしと判定されてしまう。
+            append_supplement(research_path, extra)
+            notes = research_path.read_text(encoding="utf-8").strip()
+            research_source = "supplied+web"
+            print(f"  補足 {len(extra)}字を research.md に追記しました")
+
+        notes = annotate(notes, sel)
+    else:
+        research_source = "web_search"
+        ask = (f"今日は{date_s}（日本時間）です。\n\n"
+               "今日の日本と世界の経済ニュースを web 検索で調べ、朝刊3分で扱う『今日の1本』を選んでください。\n"
+               "日本国内の話題と世界の話題のバランスを意識してください。\n\n"
+               "選んだら、次を出典URLつきの箇条書きで書き出してください。\n"
+               "1. 何が起きたか（日付・金額・水準などの具体的な数字を必ず含める）\n"
+               "2. なぜそうなるのか（因果を3段階で）\n"
+               "3. 押さえるべき数字4つ（項目名・数値・単位・補足）\n"
+               "4. 数値の推移があればその系列（2〜5点、日付と値）\n"
+               "5. 生活への影響3つ\n"
+               "6. この見方への反論・反証を1つ\n\n"
+               "裏が取れなかった数字は使わず、その旨を書いてください。")
+        if recent:
+            ask += f"\n\n直近で扱ったテーマです。重複を避けてください:\n{recent}"
+
+        print(f"[調査] {date_s} のニュースを web検索中…")
+        res1 = call({
+            "model": model, "max_tokens": 8000,
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 10}],
+            "messages": [{"role": "user", "content": ask}],
+            "system": RULES,
+        }, key)
+        notes = "".join(b.get("text", "") for b in res1["content"] if b.get("type") == "text").strip()
+        if len(notes) < 200:
+            raise SystemExit("調査結果が短すぎます。中断します。\n" + notes)
+        u1 = res1.get("usage", {})
+        print(f"  調査完了（{len(notes)}字 / in {u1.get('input_tokens')} out {u1.get('output_tokens')}）")
 
     # ---- 2回目: 構造化する ----
-    print("[2/2] 5枚分の原稿に構成中…")
+    print("[構成] 5枚分の原稿に組み立て中…")
     res2 = call({
         "model": model, "max_tokens": 8000,
         "system": RULES,
@@ -179,12 +356,19 @@ def main():
     doc["eyebrow"] = "ECONOMY BRIEF"
     doc["handle"] = os.environ.get("ACCOUNT_HANDLE", "@economy-social")
     doc["model"] = model
+    doc["research_source"] = research_source
+    if verdict:
+        doc["research_verdict"] = verdict
     doc["generated_at"] = datetime.now(timezone.utc).isoformat()
 
     (day_dir / "content.json").write_text(
         json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
-    (day_dir / "research.md").write_text(
-        f"# {date_s} 調査メモ\n\n{notes}\n", encoding="utf-8")
+    if research_source == "web_search":
+        (day_dir / "research.md").write_text(
+            f"# {date_s} 調査メモ\n\n{notes}\n", encoding="utf-8")
+    else:
+        # 人が用意したメモ。検証のよりどころなので、加工も上書きもしない。
+        print(f"  {research_path} は原文のまま残します（上書きしません）")
 
     for name in ("instagram", "threads", "bluesky"):
         (day_dir / f"{name}.txt").write_text(doc["captions"][name].strip() + "\n", encoding="utf-8")
