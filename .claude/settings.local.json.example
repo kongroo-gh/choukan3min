@@ -1,0 +1,117 @@
+// 無人の定期実行が承認待ちで止まらないための許可リスト。
+// このファイルを .claude/settings.local.json にコピーして使う。
+// settings.local.json 自体は gitignore されている（機械ごとの設定のため）。
+//
+// 注意: 手動実行で承認すると、その時の日付が焼き込まれた形で追記される。
+//       例 Bash(python3 scripts/render.py post/2026-08-29)
+//       翌日から一致しなくなるので、必ずワイルドカードに直すこと。
+//
+// WebFetch は列挙にしてある。無制限にすると無人のAIが任意のサイトを
+// 読める状態になり、ページに書かれた内容に引きずられる危険がある。
+// この一覧は NIGHTLY_TASK.md 内の一覧と必ず一致させること。
+{
+  "permissions": {
+    "allow": [
+      "Bash(TZ=Asia/Tokyo date *)",
+      "Bash(mkdir -p post/*)",
+      "Bash(python3 scripts/recent_topics.py *)",
+      "Bash(python3 scripts/gemini_research.py *)",
+      "Bash(source ~/.config/choukan3min.env && python3 scripts/gemini_research.py *)",
+      "Bash(python3 scripts/render.py *)",
+      "Bash(python3 scripts/validate.py *)",
+      "Bash(python3 scripts/check_review.py *)",
+      "Bash(python3 -c *)",
+      "Bash(python3 - *)",
+      "Bash(:)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push)",
+      "Bash(git push *)",
+      "Bash(git status)",
+      "Bash(git status *)",
+      "Bash(git diff)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(ls *)",
+      "Bash(cat post/*)",
+      "Bash(grep *)",
+      "Bash(wc *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(sed -n *)",
+      "Bash(shasum *)",
+      "Bash(find post/*)",
+      "Write(post/**)",
+      "Edit(post/**)",
+      "Read(post/**)",
+      "WebSearch",
+
+      "WebFetch(domain:www.nikkei.com)",
+      "WebFetch(domain:business.nikkei.com)",
+      "WebFetch(domain:xtech.nikkei.com)",
+      "WebFetch(domain:www.asahi.com)",
+      "WebFetch(domain:mainichi.jp)",
+      "WebFetch(domain:www.yomiuri.co.jp)",
+      "WebFetch(domain:www.sankei.com)",
+      "WebFetch(domain:www.tokyo-np.co.jp)",
+      "WebFetch(domain:www.chunichi.co.jp)",
+      "WebFetch(domain:www.nishinippon.co.jp)",
+      "WebFetch(domain:www.hokkaido-np.co.jp)",
+      "WebFetch(domain:kahoku.news)",
+      "WebFetch(domain:www.kobe-np.co.jp)",
+      "WebFetch(domain:www.toonippo.co.jp)",
+
+      "WebFetch(domain:www.jiji.com)",
+      "WebFetch(domain:sp.m.jiji.com)",
+      "WebFetch(domain:www.kyodo.co.jp)",
+      "WebFetch(domain:nordot.app)",
+      "WebFetch(domain:news.yahoo.co.jp)",
+
+      "WebFetch(domain:www3.nhk.or.jp)",
+      "WebFetch(domain:www.nhk.or.jp)",
+      "WebFetch(domain:www.nhk.jp)",
+      "WebFetch(domain:news.tv-asahi.co.jp)",
+      "WebFetch(domain:news.ntv.co.jp)",
+      "WebFetch(domain:newsdig.tbs.co.jp)",
+      "WebFetch(domain:www.fnn.jp)",
+      "WebFetch(domain:www.tv-tokyo.co.jp)",
+      "WebFetch(domain:txbiz.tv-tokyo.co.jp)",
+
+      "WebFetch(domain:toyokeizai.net)",
+      "WebFetch(domain:diamond.jp)",
+      "WebFetch(domain:president.jp)",
+      "WebFetch(domain:www.bloomberg.co.jp)",
+      "WebFetch(domain:www.bloomberg.com)",
+      "WebFetch(domain:jp.reuters.com)",
+      "WebFetch(domain:www.reuters.com)",
+      "WebFetch(domain:jp.wsj.com)",
+      "WebFetch(domain:www.wsj.com)",
+      "WebFetch(domain:www.ft.com)",
+      "WebFetch(domain:www.bbc.com)",
+      "WebFetch(domain:apnews.com)",
+      "WebFetch(domain:www.cnbc.com)",
+      "WebFetch(domain:www.economist.com)",
+
+      "WebFetch(domain:www.boj.or.jp)",
+      "WebFetch(domain:www.stat.go.jp)",
+      "WebFetch(domain:www.e-stat.go.jp)",
+      "WebFetch(domain:www.soumu.go.jp)",
+      "WebFetch(domain:www.mof.go.jp)",
+      "WebFetch(domain:www.meti.go.jp)",
+      "WebFetch(domain:www.mhlw.go.jp)",
+      "WebFetch(domain:www.maff.go.jp)",
+      "WebFetch(domain:www.mlit.go.jp)",
+      "WebFetch(domain:www.cao.go.jp)",
+      "WebFetch(domain:www.esri.cao.go.jp)",
+      "WebFetch(domain:www.cfa.go.jp)",
+      "WebFetch(domain:www.jetro.go.jp)",
+      "WebFetch(domain:www.jpx.co.jp)",
+      "WebFetch(domain:www.imf.org)",
+      "WebFetch(domain:www.oecd.org)",
+      "WebFetch(domain:www.worldbank.org)",
+      "WebFetch(domain:www.federalreserve.gov)",
+      "WebFetch(domain:www.ecb.europa.eu)",
+      "WebFetch(domain:www.bls.gov)"
+    ]
+  }
+}
