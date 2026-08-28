@@ -1,4 +1,14 @@
-name: 朝刊3分 毎朝の生成と投稿
+name: 朝刊3分 毎朝の投稿
+
+# 原稿はローカル（Claude Code）で作って commit しておく。
+# ここは「検査して投稿する」だけを行う。Anthropic API は一切呼ばない。
+#
+#   ローカル  調査 → 構成 → 画像 → 関門1 → 関門2 → commit & push
+#   ここ      揃っているか確認 → 関門1を再実行 → 関門2の結果を確認 → 投稿
+#
+# 関門2（中身の校閲）はローカルで行うが、その結果 review.json の存在と
+# 原稿との対応を check_review.py が機械的に確かめる。校閲を忘れたまま、
+# あるいは校閲後に原稿を差し替えたままでは投稿できない。
 
 on:
   schedule:
@@ -11,11 +21,7 @@ on:
         required: false
         default: ''
       dry_run:
-        description: '生成と検査だけ行い、投稿はしない'
-        type: boolean
-        default: false
-      regenerate:
-        description: '既に content.json があっても作り直す'
+        description: '検査だけ行い、投稿はしない'
         type: boolean
         default: false
 
@@ -30,7 +36,7 @@ permissions:
 jobs:
   brief:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -43,60 +49,58 @@ jobs:
           echo "dir=post/$DAY" >> "$GITHUB_OUTPUT"
           echo "対象: post/$DAY"
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-
-      - name: 日本語フォントを入れる
+      - name: 今日の原稿があるか確かめる
+        id: have
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra
-          if fc-list :lang=ja family | grep -qi "Noto Serif CJK JP"; then
-            echo "明朝フォントを確認しました。"
+          DIR="${{ steps.d.outputs.dir }}"
+          DAY="${{ steps.d.outputs.day }}"
+          if [ -f "$DIR/content.json" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "原稿があります: $DIR"
           else
-            echo "::error::Noto Serif CJK JP が見つかりません。日本語が豆腐（□）になるため中止します。"
-            fc-list :lang=ja family | sort -u | head -20
-            exit 1
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::$DIR に原稿がありません。投稿せず終了します。"
+            {
+              echo "### $DAY は休刊です"
+              echo ""
+              echo "\`$DIR/content.json\` が見つかりませんでした。"
+              echo "ローカルで原稿を作って push すると、次回の実行で投稿されます。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            BODY=$(printf '%s\n' \
+              "\`$DIR/content.json\` が見つからないため、投稿を行いませんでした。" \
+              "" \
+              "原稿はローカル（Claude Code）で作って commit する運用です。" \
+              "考えられる原因:" \
+              "- Mac がスリープしていて、朝の生成が走らなかった" \
+              "- 生成はしたが push していない" \
+              "- 検査で止まって原稿が完成しなかった" \
+              "" \
+              "実行ログ: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+            gh issue create \
+              --title "朝刊3分 $DAY は原稿がありませんでした" \
+              --body "$BODY" \
+              2>/dev/null || echo "Issue の作成をスキップしました"
           fi
 
-      - name: Chromium を入れる
-        run: |
-          pip install --quiet playwright
-          python -m playwright install --with-deps chromium
+      - uses: actions/setup-python@v5
+        if: steps.have.outputs.ready == 'true'
+        with:
+          python-version: '3.12'
 
-      - name: 直近のテーマを集める（重複回避のため）
-        id: recent
-        run: |
-          {
-            echo 'topics<<TOPICS_EOF'
-            python3 scripts/recent_topics.py 7
-            echo TOPICS_EOF
-          } >> "$GITHUB_OUTPUT"
-
-      - name: 原稿を作る
-        if: github.event.inputs.regenerate == 'true' || hashFiles(format('{0}/content.json', steps.d.outputs.dir)) == ''
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-4-5' }}
-          ACCOUNT_HANDLE: ${{ vars.ACCOUNT_HANDLE || '@economy-social' }}
-          RECENT_TOPICS: ${{ steps.recent.outputs.topics }}
-        run: python3 scripts/generate.py "${{ steps.d.outputs.dir }}"
-
-      - name: 画像を書き出す
-        run: python3 scripts/render.py "${{ steps.d.outputs.dir }}"
-
-      - name: 形式を検査する
+      - name: 形式を検査する（関門1）
+        if: steps.have.outputs.ready == 'true'
         run: python3 scripts/validate.py "${{ steps.d.outputs.dir }}"
 
-      - name: 中身を校閲する（調査メモとの突き合わせ）
+      - name: 校閲の結果を確認する（関門2）
+        if: steps.have.outputs.ready == 'true'
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-4-5' }}
           REVIEW_STRICT: ${{ vars.REVIEW_STRICT }}
-        run: python3 scripts/review.py "${{ steps.d.outputs.dir }}"
+        run: python3 scripts/check_review.py "${{ steps.d.outputs.dir }}"
 
       - name: 生成物を残す（Actions画面から確認できる）
+        if: steps.have.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: brief-${{ steps.d.outputs.day }}
@@ -105,19 +109,12 @@ jobs:
             ${{ steps.d.outputs.dir }}/bluesky/*.png
             ${{ steps.d.outputs.dir }}/*.txt
             ${{ steps.d.outputs.dir }}/*.json
+            ${{ steps.d.outputs.dir }}/*.md
           retention-days: 30
-
-      - name: コミットする
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "${{ steps.d.outputs.dir }}"
-          git diff --staged --quiet || git commit -m "brief: ${{ steps.d.outputs.day }}"
-          git pull --rebase --autostash || true
-          git push
 
       - name: 公開してよいか判定する
         id: gate
+        if: steps.have.outputs.ready == 'true'
         run: |
           # AUTO_PUBLISH が明示的に false のときだけ止める。未設定なら投稿する。
           PUB=true
@@ -143,6 +140,8 @@ jobs:
       - name: 投稿済みの印を残す
         if: steps.gate.outputs.publish == 'true'
         run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           date -u +"%Y-%m-%dT%H:%M:%SZ" > "${{ steps.d.outputs.dir }}/.posted-bluesky"
           git add "${{ steps.d.outputs.dir }}/.posted-bluesky"
           git commit -m "posted: ${{ steps.d.outputs.day }} (bluesky)"
@@ -150,10 +149,10 @@ jobs:
           git push
 
       - name: 投稿しなかった理由を記録する
-        if: steps.gate.outputs.publish != 'true'
+        if: steps.have.outputs.ready == 'true' && steps.gate.outputs.publish != 'true'
         run: |
           {
-            echo "### ${{ steps.d.outputs.day }} の原稿ができました（未投稿）"
+            echo "### ${{ steps.d.outputs.day }} の原稿は検査を通りました（未投稿）"
             echo ""
             echo "投稿は行っていません。理由は次のいずれかです。"
             echo "- Variables の \`AUTO_PUBLISH\` が \`false\` になっている"
@@ -161,7 +160,6 @@ jobs:
             echo "- 既に \`.posted-bluesky\` があり、二重投稿を防いだ"
             echo ""
             echo "上の Artifacts から画像とキャプションを確認できます。"
-            echo "投稿するには Run workflow を \`dry_run\` なしで再実行してください。"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 失敗したら Issue を立てる
@@ -176,10 +174,10 @@ jobs:
             "実行ログ: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             "" \
             "投稿は行われていません。ログを確認してください。よくある原因:" \
-            "- \`ANTHROPIC_API_KEY\` の期限切れ・残高不足" \
             "- 検査（validate.py）に引っかかった（禁止表現・文字数超過・出典不足など）" \
+            "- 校閲の確認（check_review.py）で止まった（review.json が無い・critical あり・原稿と不一致）" \
             "- Bluesky のアプリパスワードが失効している")
           gh issue create \
-            --title "朝刊3分 ${{ steps.d.outputs.day }} の生成に失敗しました" \
+            --title "朝刊3分 ${{ steps.d.outputs.day }} の投稿に失敗しました" \
             --body "$BODY" \
             2>/dev/null || echo "Issue の作成をスキップしました"

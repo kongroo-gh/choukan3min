@@ -16,6 +16,7 @@ critical が1件でも出れば異常終了し、投稿は行われない。
     CLAUDE_MODEL        任意（既定 claude-sonnet-4-5）
     REVIEW_STRICT       任意。"1" にすると warning でも止める
 """
+import hashlib
 import json
 import os
 import sys
@@ -122,6 +123,10 @@ def main():
     crit = [i for i in issues if i.get("severity") == "critical"]
     warns = [i for i in issues if i.get("severity") == "warning"]
 
+    # どの原稿を校閲したのかを残す。check_review.py がこれで
+    # 「校閲後に原稿だけ差し替える」を弾く。
+    out["content_sha256"] = hashlib.sha256(
+        (day / "content.json").read_bytes()).hexdigest()
     (day / "review.json").write_text(
         json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
 

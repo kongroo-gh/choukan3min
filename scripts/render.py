@@ -9,9 +9,16 @@
     post/<日付>/bluesky/01.png 〜 04.png     （4枚。3枚目を落とした版）
 
 デザインは案C「GAZETTE（新聞風）」。配色と書体はここで固定している。
+
+画像化は playwright を使う。入っていなければ、手元の Google Chrome などを
+ヘッドレスで呼んで代用する（CHROME_PATH で場所を指定できる）。どちらも
+Chromium 系なので出来上がりは変わらない。
 """
 import asyncio
 import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -242,7 +249,46 @@ def page(doc, s, i, total):
             f'body{{background:{T["bg"]}}}</style></head><body>{board}</body></html>')
 
 
-async def shoot(pairs):
+CHROME_CANDIDATES = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+]
+
+
+def find_chrome():
+    """手元にある Chromium 系ブラウザを探す。CHROME_PATH があればそれを優先。"""
+    p = os.environ.get("CHROME_PATH", "").strip()
+    if p and Path(p).exists():
+        return p
+    for c in CHROME_CANDIDATES:
+        if Path(c).exists():
+            return c
+    return shutil.which("google-chrome") or shutil.which("chromium")
+
+
+def shoot_chrome(pairs, exe):
+    """playwright が無い環境向け。既にあるブラウザをヘッドレスで使う。
+
+    playwright 版と同じ Chromium 系の描画なので、出来上がりは一致する。
+    """
+    for html_path, png_path in pairs:
+        subprocess.run(
+            [exe, "--headless", "--disable-gpu", "--hide-scrollbars",
+             "--force-device-scale-factor=1", "--virtual-time-budget=2000",
+             f"--window-size={W},{H}",
+             f"--screenshot={png_path.resolve()}",
+             "file://" + str(html_path.resolve())],
+            check=True, capture_output=True)
+        if not png_path.exists():
+            raise SystemExit(f"画像を書き出せませんでした: {png_path}")
+        print(f"  {png_path}")
+
+
+async def shoot_playwright(pairs):
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         b = await p.chromium.launch()
@@ -254,6 +300,22 @@ async def shoot(pairs):
                                 clip={"x": 0, "y": 0, "width": W, "height": H})
             print(f"  {png_path}")
         await b.close()
+
+
+def shoot(pairs):
+    """playwright があればそれを使い、無ければ手元のブラウザで代用する。"""
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        exe = find_chrome()
+        if not exe:
+            raise SystemExit(
+                "playwright も Chromium 系ブラウザも見つかりません。どちらかを用意してください。\n"
+                "  pip3 install playwright && python3 -m playwright install chromium\n"
+                "  または Google Chrome を入れる（CHROME_PATH で場所を指定してもよい）")
+        print(f"  playwright が無いため {exe} を使います")
+        return shoot_chrome(pairs, exe)
+    asyncio.run(shoot_playwright(pairs))
 
 
 def main():
@@ -282,7 +344,7 @@ def main():
         pairs.append((h, bs / f"{n+1:02d}.png"))
 
     print(f"書き出し: {len(pairs)} 枚")
-    asyncio.run(shoot(pairs))
+    shoot(pairs)
     for f in tmp.glob("*.html"):
         f.unlink()
     tmp.rmdir()
