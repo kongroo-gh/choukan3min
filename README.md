@@ -8,29 +8,73 @@
 
 ## 毎朝なにが起きるか
 
+原稿づくりは**手元の Claude Code**が行い、GitHub Actions は**検査して投稿するだけ**です。
+Anthropic API は使いません。**費用は $0** です。
+
 ```
-6:35 JST  GitHub Actions が起動
+前夜（Mac / Claude Code）
    │
-   ├─ generate.py   Claude API（web検索つき）で当日の経済ニュースを調査
-   │                → 今日の1本を選び、5枚分の原稿と媒体別キャプションを content.json に
+   ├─ ① 収集      Claude Code が web検索 → sources.md（URL＋本文）
+   ├─ ② 整理      Gemini（無料枠）が6項目へ → research.md
+   │              書き手（Claude）と整理役を分けて、校閲の独立性を上げる
+   ├─ ③ 構成      research.md だけを根拠に content.json
+   ├─ ④ 画像      render.py → instagram 5枚 / bluesky 4枚
+   ├─ ⑤ 関門1     validate.py（形式。API不要・確定的）
+   ├─ ⑥ 関門2     原稿と research.md を突き合わせ → review.json
+   └─ ⑦ commit & push
+                          │
+翌朝 6:35 JST（GitHub Actions）
    │
-   ├─ render.py     content.json から画像を書き出し
-   │                → instagram/01〜05.png（5枚）、bluesky/01〜04.png（4枚）
-   │
-   ├─ validate.py   形式の検査。禁止表現・文字数・ハッシュタグ数・出典・画像枚数
-   │                → 1つでも引っかかればここで停止。投稿しない
-   │
-   ├─ review.py     中身の校閲。原稿を調査メモと突き合わせ、
-   │                根拠のない数字や桁違いを別のモデル呼び出しで検出
-   │                → critical が1件でもあれば停止。投稿しない
-   │
-   ├─ 生成物を Artifacts に保存 ＆ post/ にコミット
-   │
-   └─ post_bluesky.py   Bluesky へ投稿（AUTO_PUBLISH=false のときだけ止まる）
+   ├─ ⑧ 原稿があるか確認   無ければ Issue を立てて休刊（ジョブは成功扱い）
+   ├─ ⑨ 関門1 を再実行     validate.py
+   ├─ ⑩ 関門2 の結果を確認 check_review.py
+   │                       review.json が無い・fail・critical あり・
+   │                       原稿と不一致 なら投稿しない
+   └─ ⑪ post_bluesky.py    Bluesky へ投稿
 ```
 
 Instagram と Threads は今のところ手投稿です（画像の公開URLが必要なため。SETUP.md 末尾に説明）。
 Artifacts から画像とキャプションを取り出して貼ってください。
+
+毎朝の手順は **[MORNING.md](MORNING.md)**、NotebookLM の使い方は
+**[NOTEBOOKLM.md](NOTEBOOKLM.md)** にあります。
+
+---
+
+## 関門2 はローカルに移してある
+
+無人で回す仕組みから人の手が入る運用に変えたため、中身の校閲もローカルで行います。
+ただし**飛ばせないようにしてあります**。
+
+`check_review.py` が Actions 側で次を確かめ、1つでも該当すれば投稿しません。
+
+- `review.json` が無い（＝校閲を忘れた）
+- `verdict` が `pass` でない、または `critical` の指摘がある
+- `content_sha256` が今の `content.json` と一致しない（＝**校閲後に原稿を差し替えた**）
+- `REVIEW_STRICT=1` のとき、`warning` が1件でもある
+
+**弱点**: 本来の `review.py` は別のAPIコールで、書き手と校閲役が完全に別でした。
+ローカルでは同じ機械の中で行うため、独立性はその分下がります。
+`review.json` の `note` に、どういう条件で校閲したかを必ず書き残してください。
+
+---
+
+## 必要な Secrets
+
+GitHub Actions 側（投稿するだけ）:
+
+| 名前 | 用途 |
+|---|---|
+| `BLUESKY_HANDLE` | `economy-social.bsky.social` |
+| `BLUESKY_APP_PASSWORD` | 設定 → プライバシーとセキュリティ → アプリパスワード |
+
+手元（原稿づくり）:
+
+| 変数 | 用途 |
+|---|---|
+| `GEMINI_API_KEY` | 整理。https://aistudio.google.com で**無料発行**。検索は使わないので無料枠で足りる |
+
+`ANTHROPIC_API_KEY` は**不要**です。構成と校閲は Claude Code（契約）で行います。
 
 ---
 
@@ -38,26 +82,30 @@ Artifacts から画像とキャプションを取り出して貼ってくださ�
 
 ```
 scripts/
-  generate.py        Claude API で原稿を作る
-  render.py          content.json → PNG（デザイン案C・新聞風）
-  validate.py        形式の検査（API不要・確定的）
-  review.py          中身の校閲（調査メモとの突き合わせ）
-  post_bluesky.py    Bluesky へ投稿
-  selftest.py        接続確認（既定では投稿しない）
-  recent_topics.py   直近のテーマ一覧（ネタの重複回避に使う）
+  render.py             content.json → PNG（デザイン案C・新聞風）
+                        playwright が無ければ手元の Chrome を使う
+  validate.py           関門1: 形式（API不要・確定的）
+  check_review.py       関門2の結果を確認（API不要・確定的）
+  post_bluesky.py       Bluesky へ投稿
+  selftest.py           接続確認（既定では投稿しない）
+  recent_topics.py      直近のテーマ一覧
+  notebooklm_prompt.py  NotebookLM に貼るプロンプトを組み立てる
+  ── ここから下は API を使う旧方式。毎朝の運用では使わない ──
+  generate.py           Claude API で原稿を作る
+  review.py             Claude API で校閲する
+  digest.py             投稿後の記録づくり
+MORNING.md              毎朝の手順
+NOTEBOOKLM.md           NotebookLM の使い方
 .github/workflows/
-  daily.yml          毎朝 6:35 JST に上を順に実行
-  bluesky-test.yml   接続テスト。このファイル1つで完結し、他のファイルを必要としない
-post/
-  2026-08-25/
-    content.json     原稿の元データ
-    research.md      その日の調査メモ（出典つき。あとで検証できる）
-    review.json      校閲結果。指摘があればここに残る
-    instagram/       5枚
-    bluesky/         4枚
-    instagram.txt / threads.txt / bluesky.txt
-    bluesky.alt.txt  画像の代替テキスト（読み上げ用）
-    .posted-bluesky  投稿後に作られる。二重投稿の防止用
+  daily.yml             毎朝6:35の投稿。API不要
+  bluesky-test.yml      接続テスト。単体で完結
+post/YYYY-MM-DD/
+  research.md      調査メモ（出典つき）。検証のよりどころ
+  content.json     原稿の元データ
+  review.json      関門2の結果。content.json のハッシュを含む
+  instagram/01-05.png   bluesky/01-04.png
+  instagram.txt  threads.txt  bluesky.txt  bluesky.alt.txt
+  .posted-bluesky  投稿後に作られる。二重投稿の防止用
 ```
 
 ---
@@ -93,7 +141,7 @@ X と Bluesky は画像4枚が上限のため、3枚目を落とした4枚版を
 - 禁止表現（「必ず儲か」「今すぐ買」「知らないと損」など17語）
 - 画像の枚数とファイルサイズ
 
-### 2段目 review.py — 中身（別のモデル呼び出し）
+### 2段目 review.json — 中身（ローカルで校閲し、CIが存在を強制）
 
 書き手ではなく校閲者として、原稿と `research.md` を突き合わせます。
 
@@ -102,11 +150,14 @@ X と Bluesky は画像4枚が上限のため、3枚目を落とした4枚版を
 - 「推計」「観測」が確定事実として書かれていないか
 - 出典のない断定的な予測、投資助言と読める記述がないか
 
-`critical` が1件でもあれば投稿を中止。`research.md` 自体が無い場合も中止します。
+結果を `review.json` に書き、`check_review.py` が Actions 側で確認します。
+`critical` が1件でもあれば投稿を中止。`review.json` が無い場合も、
+校閲後に `content.json` を差し替えた場合も中止します。
 `REVIEW_STRICT=1` にすると `warning` でも止まります。
 
 **それでも防げないこと**: 調査の段階で拾った情報がそもそも誤っていた場合。
 出典URLは `research.md` に残るので、気になったときは辿って確認してください。
+また、書き手と校閲役が同じ機械の中にいるため、独立性は API 方式より下がります。
 
 ---
 
@@ -127,8 +178,12 @@ X と Bluesky は画像4枚が上限のため、3枚目を落とした4枚版を
 
 | | 目安 |
 |---|---|
-| Anthropic API | 1日 $0.35〜0.70 / 月 $11〜21（調査・構成・校閲の3コール） |
-| GitHub Actions | 公開リポジトリなら無料・無制限。非公開なら月200〜240分（無料枠2,000分内） |
+| Anthropic API | **$0**（毎朝の運用では呼ばない） |
+| GitHub Actions | 公開リポジトリなら無料・無制限 |
 | Bluesky | 無料 |
 
-Anthropic のコンソールで必ず月額上限を設定してください。
+原稿づくりは手元の Claude Code が行うため、Claude の契約の使用量は消費します。
+
+API を使う旧方式（`generate.py` / `review.py`）に戻す場合は、
+1日 $0.35〜0.70・月 $11〜21 が目安です。その際は Anthropic のコンソールで
+月額上限を設定してください。
