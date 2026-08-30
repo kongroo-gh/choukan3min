@@ -318,6 +318,37 @@ def shoot(pairs):
     asyncio.run(shoot_playwright(pairs))
 
 
+def write_captions(day, doc, n_images):
+    """content.json の captions を媒体ごとの .txt に書き出す。
+
+    post_bluesky.py は bluesky.txt を読む。無いと投稿ステップだけが翌朝落ちる。
+    validate.py も check_review.py も .txt の有無は見ないので、手で作る運用だと
+    関門を通ったまま push され、朝になって初めて気づくことになる。
+    captions から決定的に作れるものなので、画像と一緒にここで書き出す。
+
+    bluesky.alt.txt は代替テキストで、原稿から機械的には作れない。
+    既にあるものは上書きせず、無い・枚数と合わないときに知らせるだけにする。
+    """
+    captions = doc.get("captions") or {}
+    for name in ("instagram", "threads", "bluesky"):
+        text = captions.get(name)
+        if not text:
+            print(f"  注意: captions.{name} がありません。{name}.txt は作りません")
+            continue
+        (day / f"{name}.txt").write_text(text.rstrip("\n") + "\n", encoding="utf-8")
+        print(f"  {day / f'{name}.txt'}（{len(text)}字）")
+
+    alt = day / "bluesky.alt.txt"
+    if not alt.exists():
+        print(f"  注意: {alt} がありません。代替テキストは手で書いてください"
+              f"（1行1枚・{n_images}行）")
+        return
+    lines = [ln for ln in alt.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    if len(lines) != n_images:
+        print(f"  注意: {alt} は {len(lines)}行ですが画像は {n_images}枚です。"
+              "原稿を直したあと代替テキストが古いままになっていないか確認してください")
+
+
 def main():
     day = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     doc = json.loads((day / "content.json").read_text(encoding="utf-8"))
@@ -348,6 +379,7 @@ def main():
     for f in tmp.glob("*.html"):
         f.unlink()
     tmp.rmdir()
+    write_captions(day, doc, len(SHORT_IDX))
     print("完了")
 
 
